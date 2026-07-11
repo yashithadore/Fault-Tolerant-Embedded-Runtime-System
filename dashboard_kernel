@@ -1,0 +1,89 @@
+#ifndef DASHBOARD_KERNEL_H
+#define DASHBOARD_KERNEL_H
+
+#include <Arduino.h>
+
+void dashboard_init();
+
+// Computes derived analytics from already-known state. Call this once
+// per sample cycle, after battery/safety/runtime states are updated.
+void dashboard_update(float imbalancePct,
+                      uint8_t battStateCode,      // 0=Healthy..3=PackFailure
+                      uint8_t safetyStateCode,     // 0=SAFE..3=RECOVERING
+                      uint8_t runtimeModeCode,     // 0=NORMAL..3=SHUTDOWN
+                      uint8_t faultLogCount,
+                      bool relayEngaged);
+
+uint8_t     dashboard_getRiskScore();        // 0-100
+const char* dashboard_getRiskLevelLabel();   // "Low" / "Medium" / "High" / "Critical"
+const char* dashboard_getRecommendation();   // actionable operator text
+
+#endif
+  ////////dashboard_kernel.cpp
+  #include "dashboard_kernel.h"
+
+static uint8_t s_riskScore = 0;
+static char    s_riskLevel[12] = "Low";
+static char    s_recommendation[64] = "System nominal. No action required.";
+
+void dashboard_init() {
+  s_riskScore = 0;
+  strcpy(s_riskLevel, "Low");
+  strcpy(s_recommendation, "System nominal. No action required.");
+}
+
+void dashboard_update(float imbalancePct,
+                      uint8_t battStateCode,
+                      uint8_t safetyStateCode,
+                      uint8_t runtimeModeCode,
+                      uint8_t faultLogCount,
+                      bool relayEngaged) {
+
+  int score = 0;
+
+  score += battStateCode * 10;
+
+  score += safetyStateCode * 12;
+  if (safetyStateCode == 3) score -= 12;
+
+  score += runtimeModeCode * 8;
+
+  if (imbalancePct >= 15.0f)      score += 15;
+  else if (imbalancePct >= 8.0f)  score += 8;
+  else if (imbalancePct >= 3.0f)  score += 3;
+
+  if (!relayEngaged && faultLogCount > 5) score += 5;
+
+  if (score < 0)   score = 0;
+  if (score > 100) score = 100;
+  s_riskScore = (uint8_t)score;
+
+  if (s_riskScore >= 75)      strcpy(s_riskLevel, "Critical");
+  else if (s_riskScore >= 45) strcpy(s_riskLevel, "High");
+  else if (s_riskScore >= 20) strcpy(s_riskLevel, "Medium");
+  else                        strcpy(s_riskLevel, "Low");
+
+  if (runtimeModeCode == 3) {
+    strcpy(s_recommendation, "System halted. Inspect hardware before restart.");
+  } else if (safetyStateCode == 2) {
+    strcpy(s_recommendation, "Relay open on fault. Do not reconnect load yet.");
+  } else if (runtimeModeCode == 2) {
+    strcpy(s_recommendation, "Multiple faults isolated. Schedule inspection soon.");
+  } else if (battStateCode == 3) {
+    strcpy(s_recommendation, "Cell below safe voltage. Replace affected cell.");
+  } else if (battStateCode == 2) {
+    strcpy(s_recommendation, "High imbalance. Balance pack at next service.");
+  } else if (runtimeModeCode == 1) {
+    strcpy(s_recommendation, "One sensor degraded. Monitor; no action yet.");
+  } else if (safetyStateCode == 1) {
+    strcpy(s_recommendation, "Weak cell detected. Monitor closely.");
+  } else if (safetyStateCode == 3) {
+    strcpy(s_recommendation, "Recovering from fault. Verify stability.");
+  } else {
+    strcpy(s_recommendation, "System nominal. No action required.");
+  }
+}
+
+uint8_t dashboard_getRiskScore() { return s_riskScore; }
+const char* dashboard_getRiskLevelLabel() { return s_riskLevel; }
+const char* dashboard_getRecommendation() { return s_recommendation; }
