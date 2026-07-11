@@ -1,0 +1,274 @@
+#ifndef TELEMETRY_KERNEL_H
+#define TELEMETRY_KERNEL_H
+
+#include <Arduino.h>
+
+void telemetry_init();
+
+// Call every loop tick. Fully non-blocking — internally decides when
+// to attempt WiFi reconnect, run Blynk, or flush queued events.
+// Codes are small integers so the module can cheaply detect "did this
+// change" without needing to know the enums defined elsewhere.
+void telemetry_update(unsigned long now,
+                      const float cellV[], uint8_t numCells,
+                      float packAvg, float imbalancePct,
+                      const char* battStateLabel, uint8_t battStateCode,
+                      const char* safetyStateLabel, uint8_t safetyStateCode,
+                      const char* runtimeModeLabel, uint8_t runtimeModeCode,
+                      bool relayEngaged,
+                      uint8_t riskScore, const char* riskLevelLabel,
+                      const char* recommendation);
+
+bool        telemetry_isConnected();
+const char* telemetry_getSignalQualityLabel();
+uint8_t     telemetry_getQueueDepth();
+
+#endif
+
+
+//////telemetry_kernel.cpp
+/*
+ * Intelligent Cloud Telemetry Architecture
+ * ------------------------------------------
+ * Event-driven (not fixed-interval) telemetry over Blynk.
+ * - Sends only on state change / anomaly / threshold violation
+ * - Non-blocking WiFi reconnect state machine
+ * - Event queue buffers data during disconnection, flushes after reconnect
+ * - Signal quality (RSSI) monitored and reported only when it changes tier
+ * - Never blocks or gates the rest of the system — pure add-on module
+ *
+ * IMPORTANT: fill in BLYNK_TEMPLATE_ID / BLYNK_TEMPLATE_NAME / auth token
+ * below before compiling.
+ */
+
+#define BLYNK_TEMPLATE_ID "TMPL3P-wPQ5i9"
+#define BLYNK_TEMPLATE_NAME "Battery Monitor"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include "telemetry_kernel.h"
+
+// ---------- CONFIG ----------
+static const char* WIFI_SSID = "Wokwi-GUEST";
+static const char* WIFI_PASS = "";
+static const char* BLYNK_AUTH = "qjooWC1oCx8MwVlpkf13GelZpo0i2dWk";
+
+static const unsigned long WIFI_RETRY_INTERVAL_MS   = 5000;
+static const unsigned long SIGNAL_CHECK_INTERVAL_MS = 4000;
+static const unsigned long QUEUE_FLUSH_PACE_MS      = 150;
+
+static const uint8_t QUEUE_CAPACITY = 20;
+
+// ---------- WIFI STATE MACHINE ----------
+enum WifiState { WIFI_ST_DISCONNECTED, WIFI_ST_CONNECTING, WIFI_ST_CONNECTED };
+static WifiState s_wifiState = WIFI_ST_DISCONNECTED;
+static unsigned long s_lastWifiAttempt = 0;
+
+static bool s_blynkReady = false;
+
+// ---------- SIGNAL QUALITY ----------
+static unsigned long s_lastSignalCheck = 0;
+static char s_signalLabel[16] = "Unknown";
+
+static const char* classifySignal(int rssi) {
+  if (rssi == 0)          return "No Signal";
+  if (rssi > -60)         return "Excellent";
+  if (rssi > -70)         return "Good";
+  if (rssi > -80)         return "Weak";
+  return "Poor";
+}
+
+// ---------- EVENT QUEUE (ring buffer) ----------
+struct TelemetryEvent {
+  char message[40];
+};
+
+static TelemetryEvent s_queue[QUEUE_CAPACITY];
+static uint8_t s_queueHead = 0;
+static uint8_t s_queueCount = 0;
+static unsigned long s_lastFlushTime = 0;
+
+static void enqueueEvent(const char* msg) {
+  strncpy(s_queue[s_queueHead].message, msg, 39);
+  s_queue[s_queueHead].message[39] = '\0';
+  s_queueHead = (s_queueHead + 1) % QUEUE_CAPACITY;
+  if (s_queueCount < QUEUE_CAPACITY) s_queueCount++;
+}
+
+// ---------- CHANGE DETECTION ----------
+static bool s_haveInit = false;
+static uint8_t s_prevBattCode = 255;
+static uint8_t s_prevSafetyCode = 255;
+static uint8_t s_prevRuntimeCode = 255;
+static bool s_prevRelayEngaged = true;
+
+static float s_prevCellV[8] = {0};
+static bool  s_prevWeak[8]  = {false};
+static const float WEAK_THRESHOLD_V = 3.20f;
+
+static char s_prevSignalLabel[16] = "";
+
+// ---------- WIFI HANDLING ----------
+static void updateWifi(unsigned long now) {
+  wl_status_t status = WiFi.status();
+
+  if (status == WL_CONNECTED) {
+    if (s_wifiState != WIFI_ST_CONNECTED) {
+      s_wifiState = WIFI_ST_CONNECTED;
+      enqueueEvent("WiFi reconnected");
+    }
+    return;
+  }
+
+  if (s_wifiState == WIFI_ST_CONNECTED) {
+    s_wifiState = WIFI_ST_DISCONNECTED;
+    s_blynkReady = false;
+    enqueueEvent("WiFi lost - buffering events");
+  }
+
+  if (now - s_lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS) {
+    s_lastWifiAttempt = now;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    s_wifiState = WIFI_ST_CONNECTING;
+  }
+}
+
+static void updateBlynkConnection() {
+  if (s_wifiState != WIFI_ST_CONNECTED) return;
+
+  if (!s_blynkReady) {
+    Blynk.config(BLYNK_AUTH);
+    Blynk.connect(0);
+    s_blynkReady = true;
+  }
+
+  Blynk.run(); 
+}
+
+// ---------- QUEUE FLUSH ----------
+static void flushQueue(unsigned long now) {
+  if (!Blynk.connected()) return;
+  if (s_queueCount == 0) return;
+  if (now - s_lastFlushTime < QUEUE_FLUSH_PACE_MS) return;
+
+  uint8_t oldestIdx = (s_queueHead + QUEUE_CAPACITY - s_queueCount) % QUEUE_CAPACITY;
+  Blynk.virtualWrite(V7, s_queue[oldestIdx].message);
+  s_queueCount--;
+  s_lastFlushTime = now;
+}
+
+// ---------- PUBLIC API ----------
+void telemetry_init() {
+  WiFi.mode(WIFI_STA);
+  s_wifiState = WIFI_ST_DISCONNECTED;
+  s_lastWifiAttempt = 0;
+  s_blynkReady = false;
+  s_queueHead = 0;
+  s_queueCount = 0;
+  s_haveInit = false;
+}
+
+void telemetry_update(unsigned long now,
+                      const float cellV[], uint8_t numCells,
+                      float packAvg, float imbalancePct,
+                      const char* battStateLabel, uint8_t battStateCode,
+                      const char* safetyStateLabel, uint8_t safetyStateCode,
+                      const char* runtimeModeLabel, uint8_t runtimeModeCode,
+                      bool relayEngaged,
+                      uint8_t riskScore, const char* riskLevelLabel,
+                      const char* recommendation) {
+
+  updateWifi(now);
+  updateBlynkConnection();
+
+  bool connectedNow = Blynk.connected();
+
+  if (now - s_lastSignalCheck >= SIGNAL_CHECK_INTERVAL_MS) {
+    s_lastSignalCheck = now;
+    int rssi = (s_wifiState == WIFI_ST_CONNECTED) ? WiFi.RSSI() : 0;
+    strncpy(s_signalLabel, classifySignal(rssi), 15);
+    s_signalLabel[15] = '\0';
+
+    if (strcmp(s_signalLabel, s_prevSignalLabel) != 0) {
+      strcpy(s_prevSignalLabel, s_signalLabel);
+      if (connectedNow) Blynk.virtualWrite(V6, s_signalLabel);
+      char msg[40];
+      snprintf(msg, 40, "Signal: %s", s_signalLabel);
+      enqueueEvent(msg);
+    }
+  }
+
+  if (!s_haveInit || battStateCode != s_prevBattCode) {
+    if (connectedNow) {
+      Blynk.virtualWrite(V0, packAvg);
+      Blynk.virtualWrite(V1, imbalancePct);
+      Blynk.virtualWrite(V2, battStateLabel);
+      Blynk.virtualWrite(V8, riskScore);
+      Blynk.virtualWrite(V9, riskLevelLabel);
+      Blynk.virtualWrite(V10, recommendation);
+      static uint8_t s_prevRiskTier = 0;  // 0=Low/Med, 1=High/Critical
+      uint8_t currentTier = (strcmp(riskLevelLabel, "High") == 0 || strcmp(riskLevelLabel, "Critical") == 0) ? 1 : 0;
+      if (currentTier == 1 && s_prevRiskTier == 0) {
+        Blynk.logEvent("high_risk_alert", "Risk level elevated - check dashboard");
+      }
+      s_prevRiskTier = currentTier;
+    }
+    char msg[40];
+    snprintf(msg, 40, "Batt: %s", battStateLabel);
+    enqueueEvent(msg);
+    s_prevBattCode = battStateCode;
+  }
+
+  if (!s_haveInit || safetyStateCode != s_prevSafetyCode) {
+    if (connectedNow) Blynk.virtualWrite(V3, safetyStateLabel);
+    char msg[40];
+    snprintf(msg, 40, "Safety: %s", safetyStateLabel);
+    enqueueEvent(msg);
+    s_prevSafetyCode = safetyStateCode;
+  }
+
+  if (!s_haveInit || runtimeModeCode != s_prevRuntimeCode) {
+    if (connectedNow) Blynk.virtualWrite(V4, runtimeModeLabel);
+    char msg[40];
+    snprintf(msg, 40, "Runtime: %s", runtimeModeLabel);
+    enqueueEvent(msg);
+    s_prevRuntimeCode = runtimeModeCode;
+  }
+
+  if (!s_haveInit || relayEngaged != s_prevRelayEngaged) {
+    if (connectedNow) Blynk.virtualWrite(V5, relayEngaged ? "CLOSED" : "OPEN");
+    char msg[40];
+    snprintf(msg, 40, "Relay: %s", relayEngaged ? "CLOSED" : "OPEN");
+    enqueueEvent(msg);
+    s_prevRelayEngaged = relayEngaged;
+  }
+
+  uint8_t n = (numCells > 8) ? 8 : numCells;
+  for (uint8_t i = 0; i < n; i++) {
+    bool weakNow = cellV[i] < WEAK_THRESHOLD_V;
+    if (!s_haveInit || weakNow != s_prevWeak[i]) {
+      char msg[40];
+      snprintf(msg, 40, "Cell%d %s threshold", i + 1, weakNow ? "below" : "above");
+      enqueueEvent(msg);
+      s_prevWeak[i] = weakNow;
+    }
+  }
+
+  s_haveInit = true;
+
+  flushQueue(now);
+}
+
+bool telemetry_isConnected() {
+  return Blynk.connected();
+}
+
+const char* telemetry_getSignalQualityLabel() {
+  return s_signalLabel;
+}
+
+uint8_t telemetry_getQueueDepth() {
+  return s_queueCount;
+}
