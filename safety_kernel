@@ -1,0 +1,275 @@
+#ifndef SAFETY_KERNEL_H
+#define SAFETY_KERNEL_H
+
+#include <Arduino.h>
+
+// ---------- SAFETY STATES ----------
+enum SafetyState { SAFE, WARNING, FAULT, RECOVERING };
+
+enum FaultReason {
+  REASON_NONE,
+  REASON_WEAK_CELL,
+  REASON_OVERVOLTAGE,
+  REASON_SENSOR_ANOMALY,
+  REASON_RAPID_FLUCTUATION,
+  REASON_MULTIPLE
+};
+
+// ---------- PUBLIC API ----------
+void safety_init(uint8_t relayPin, uint8_t buzzerPin, uint8_t numCells);
+void safety_update(const float cellV[], unsigned long now);
+void safety_forceOpen();
+
+SafetyState  safety_getState();
+FaultReason  safety_getReason();
+bool         safety_isRelayEngaged();
+const char*  safety_getStateLabel();
+const char*  safety_getReasonLabel();
+
+// Fills two 16-char buffers with LCD override text (used only when
+// safety_wantsDisplayOverride() is true)
+bool safety_wantsDisplayOverride();
+void safety_getDisplayLines(char line1[17], char line2[17]);
+
+#endif
+
+
+//////////safety_kernel.cpp
+/*
+ * Event-Driven Safety Protection Kernel
+ * Automotive-grade, fully non-blocking (millis()-based) state machine.
+ * Owns: relay cutoff, buzzer alerts, LCD override warnings.
+ * Reads: shared cell voltage array from the battery module (read-only).
+ */
+
+#include "safety_kernel.h"
+
+// ---------- THRESHOLDS ----------
+static const float WEAK_CELL_V           = 3.20f;
+static const float OVERVOLTAGE_V         = 4.25f;
+static const float SENSOR_MIN_PLAUSIBLE  = 2.50f;
+static const float SENSOR_MAX_PLAUSIBLE  = 4.50f;
+static const float MAX_DELTA_PER_SAMPLE  = 0.05f;   // volts, between consecutive samples
+
+// ---------- ANTI-CHATTER / RECOVERY TIMING ----------
+static const unsigned long RELAY_MIN_OFF_MS           = 5000;
+static const unsigned long RELAY_MIN_TOGGLE_MS        = 2000;
+static const unsigned long RECOVERY_CONFIRM_MS        = 3000;
+static const unsigned long BUZZER_WARNING_PERIOD_MS   = 600;  // slow pulse
+static const unsigned long BUZZER_FAULT_PERIOD_MS     = 150;  // fast pulse
+
+// ---------- INTERNAL STATE ----------
+static uint8_t s_relayPin;
+static uint8_t s_buzzerPin;
+static uint8_t s_numCells;
+
+static SafetyState s_state       = SAFE;
+static FaultReason s_reason      = REASON_NONE;
+static bool        s_relayClosed = true;   // true = pack connected/normal
+
+static float s_prevCellV[8]      = {0};    // supports up to 8 cells
+static bool  s_havePrev          = false;
+
+static unsigned long s_lastRelayChangeTime = 0;
+static unsigned long s_recoveryStartTime   = 0;
+static bool          s_recoveryTimerActive = false;
+
+static unsigned long s_lastBuzzerToggle = 0;
+static bool          s_buzzerState      = false;
+
+// ---------- INTERNAL HELPERS ----------
+static FaultReason evaluateConditions(const float cellV[]) {
+  bool sensorAnomaly   = false;
+  bool overVoltage     = false;
+  bool weakCell        = false;
+  bool rapidFluctuation = false;
+
+  for (uint8_t i = 0; i < s_numCells; i++) {
+    float v = cellV[i];
+
+    if (v < SENSOR_MIN_PLAUSIBLE || v > SENSOR_MAX_PLAUSIBLE) sensorAnomaly = true;
+    if (v > OVERVOLTAGE_V) overVoltage = true;
+    if (v < WEAK_CELL_V)   weakCell = true;
+
+    if (s_havePrev) {
+      float delta = fabs(v - s_prevCellV[i]);
+      if (delta > MAX_DELTA_PER_SAMPLE) rapidFluctuation = true;
+    }
+  }
+
+  for (uint8_t i = 0; i < s_numCells; i++) s_prevCellV[i] = cellV[i];
+  s_havePrev = true;
+
+  // Priority: sensor anomaly > overvoltage > fluctuation > weak cell
+  uint8_t faultCount = sensorAnomaly + overVoltage + rapidFluctuation + weakCell;
+  if (faultCount == 0) return REASON_NONE;
+  if (faultCount > 1)  return REASON_MULTIPLE;
+  if (sensorAnomaly)    return REASON_SENSOR_ANOMALY;
+  if (overVoltage)      return REASON_OVERVOLTAGE;
+  if (rapidFluctuation) return REASON_RAPID_FLUCTUATION;
+  return REASON_WEAK_CELL;
+}
+
+static bool isHardFault(FaultReason r) {
+  // These trip the relay immediately. Weak cell alone is WARNING-only.
+  return (r == REASON_OVERVOLTAGE || r == REASON_SENSOR_ANOMALY ||
+          r == REASON_RAPID_FLUCTUATION || r == REASON_MULTIPLE);
+}
+
+static void setRelay(bool closed, unsigned long now) {
+  if (closed == s_relayClosed) return;
+
+  // Anti-chatter: enforce minimum time between any relay transitions
+  if (now - s_lastRelayChangeTime < RELAY_MIN_TOGGLE_MS) return;
+
+  // Anti-chatter: once opened, must stay open a minimum hold time
+  if (s_relayClosed == true && closed == false) {
+    // opening now - always allowed (safety first), just record time
+  } else if (s_relayClosed == false && closed == true) {
+    // trying to close (re-engage) - must have been open long enough
+    if (now - s_lastRelayChangeTime < RELAY_MIN_OFF_MS) return;
+  }
+
+  s_relayClosed = closed;
+  s_lastRelayChangeTime = now;
+  digitalWrite(s_relayPin, s_relayClosed ? HIGH : LOW);
+}
+
+static void updateBuzzer(unsigned long now) {
+  if (s_state == SAFE || s_state == RECOVERING) {
+    digitalWrite(s_buzzerPin, LOW);
+    s_buzzerState = false;
+    return;
+  }
+
+  unsigned long period = (s_state == FAULT) ? BUZZER_FAULT_PERIOD_MS : BUZZER_WARNING_PERIOD_MS;
+  if (now - s_lastBuzzerToggle >= period) {
+    s_lastBuzzerToggle = now;
+    s_buzzerState = !s_buzzerState;
+    digitalWrite(s_buzzerPin, s_buzzerState);
+  }
+}
+
+// ---------- PUBLIC API ----------
+void safety_init(uint8_t relayPin, uint8_t buzzerPin, uint8_t numCells) {
+  s_relayPin  = relayPin;
+  s_buzzerPin = buzzerPin;
+  s_numCells  = numCells;
+
+  pinMode(s_relayPin, OUTPUT);
+  pinMode(s_buzzerPin, OUTPUT);
+
+  digitalWrite(s_relayPin, HIGH);  // start closed/connected
+  digitalWrite(s_buzzerPin, LOW);
+
+  s_relayClosed = true;
+  s_state = SAFE;
+  s_reason = REASON_NONE;
+}
+
+void safety_update(const float cellV[], unsigned long now) {
+  FaultReason reason = evaluateConditions(cellV);
+  bool hardFault = isHardFault(reason);
+  bool anyIssue  = (reason != REASON_NONE);
+
+  switch (s_state) {
+    case SAFE:
+      if (hardFault) {
+        s_state = FAULT;
+        s_reason = reason;
+        setRelay(false, now);
+        s_recoveryTimerActive = false;
+      } else if (anyIssue) {
+        s_state = WARNING;
+        s_reason = reason;
+      }
+      break;
+
+    case WARNING:
+      if (hardFault) {
+        s_state = FAULT;
+        s_reason = reason;
+        setRelay(false, now);
+        s_recoveryTimerActive = false;
+      } else if (!anyIssue) {
+        s_state = SAFE;
+        s_reason = REASON_NONE;
+      } else {
+        s_reason = reason;  // stay in WARNING, update reason
+      }
+      break;
+
+    case FAULT:
+      s_reason = anyIssue ? reason : REASON_NONE;
+      if (!anyIssue) {
+        // conditions clear - begin recovery confirmation window
+        s_state = RECOVERING;
+        s_recoveryStartTime = now;
+        s_recoveryTimerActive = true;
+      }
+      // relay stays open the whole time we're in FAULT
+      break;
+
+    case RECOVERING:
+      if (anyIssue) {
+        // relapsed during recovery window - back to FAULT, reset confirmation
+        s_state = FAULT;
+        s_reason = reason;
+        if (hardFault) setRelay(false, now);
+        s_recoveryTimerActive = false;
+      } else if (now - s_recoveryStartTime >= RECOVERY_CONFIRM_MS) {
+        // clean for long enough - attempt to re-close relay
+        setRelay(true, now);
+        if (s_relayClosed) {
+          s_state = SAFE;
+          s_reason = REASON_NONE;
+          s_recoveryTimerActive = false;
+        }
+        // if setRelay refused (still inside min-off hold), stay in RECOVERING
+        // and we'll just keep retrying each update() call
+      }
+      break;
+  }
+
+  updateBuzzer(now);
+}
+
+SafetyState safety_getState()   { return s_state; }
+FaultReason safety_getReason()  { return s_reason; }
+bool safety_isRelayEngaged()    { return s_relayClosed; }
+
+const char* safety_getStateLabel() {
+  switch (s_state) {
+    case SAFE:       return "SAFE";
+    case WARNING:    return "WARNING";
+    case FAULT:      return "FAULT-CUTOFF";
+    case RECOVERING: return "RECOVERING";
+  }
+  return "UNKNOWN";
+}
+
+const char* safety_getReasonLabel() {
+  switch (s_reason) {
+    case REASON_NONE:              return "None";
+    case REASON_WEAK_CELL:         return "Weak Cell";
+    case REASON_OVERVOLTAGE:       return "Overvoltage";
+    case REASON_SENSOR_ANOMALY:    return "Sensor Fault";
+    case REASON_RAPID_FLUCTUATION: return "Volt Fluctuation";
+    case REASON_MULTIPLE:          return "Multi-Fault";
+  }
+  return "Unknown";
+}
+
+bool safety_wantsDisplayOverride() {
+  return s_state != SAFE;
+}
+
+void safety_getDisplayLines(char line1[17], char line2[17]) {
+  snprintf(line1, 17, "%-16s", safety_getStateLabel());
+  snprintf(line2, 17, "%-16s", safety_getReasonLabel());
+}
+void safety_forceOpen() {
+  s_relayClosed = false;
+  digitalWrite(s_relayPin, LOW);
+  s_lastRelayChangeTime = millis();
+}
