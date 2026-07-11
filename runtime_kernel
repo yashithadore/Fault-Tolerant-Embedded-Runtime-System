@@ -1,0 +1,252 @@
+#ifndef RUNTIME_KERNEL_H
+#define RUNTIME_KERNEL_H
+
+#include <Arduino.h>
+
+enum OperationalMode { MODE_NORMAL, MODE_DEGRADED, MODE_FAILSAFE, MODE_SHUTDOWN };
+
+enum FaultCode {
+  RT_FAULT_NONE,
+  RT_FAULT_SENSOR_DISCONNECTED,
+  RT_FAULT_INVALID_READING,
+  RT_FAULT_ADC_FROZEN,
+  RT_FAULT_RELAY_MISMATCH
+};
+
+struct FaultLogEntry {
+  unsigned long timestamp;
+  FaultCode code;
+  int8_t cellIndex;
+};
+
+void runtime_init(uint8_t numCells);
+
+void runtime_update(unsigned long now, const float cellV[], uint8_t numCells,
+                    bool relayEngaged, bool relayFaultActive);
+
+OperationalMode runtime_getMode();
+const char*     runtime_getModeLabel();
+bool            runtime_isCellFaulty(uint8_t index);
+bool            runtime_forcesShutdown();
+
+uint8_t         runtime_getFaultLogCount();
+FaultLogEntry   runtime_getFaultLogEntry(uint8_t i);
+void            runtime_printFaultLog();
+
+#endif
+//////////runtimr_kernel.cpp
+#include "runtime_kernel.h"
+
+static const uint8_t  MAX_CELLS        = 8;
+static const uint8_t  LOG_CAPACITY     = 16;
+
+static const float    RAIL_EPSILON        = 0.01f;
+static const float    FREEZE_EPSILON      = 0.001f;
+static const unsigned long FREEZE_TIMEOUT_MS      = 3000;
+static const unsigned long DISCONNECT_CONFIRM_MS  = 1000;
+static const unsigned long RELAY_RESPONSE_MAX_MS  = 6000;
+static const unsigned long RECOVERY_CONFIRM_MS    = 3000;
+static const unsigned long SHUTDOWN_ESCALATION_MS = 10000;
+
+static uint8_t s_numCells = 0;
+
+static float s_prevValue[MAX_CELLS]      = {0};
+static unsigned long s_lastChangeTime[MAX_CELLS] = {0};
+static bool s_cellFaulty[MAX_CELLS]      = {false};
+static FaultCode s_cellFaultCode[MAX_CELLS] = {RT_FAULT_NONE};
+static unsigned long s_cellCleanSince[MAX_CELLS] = {0};
+static bool s_haveInit = false;
+
+static unsigned long s_relayFaultStartTime = 0;
+static bool s_relayMismatch = false;
+
+static OperationalMode s_mode = MODE_NORMAL;
+static unsigned long s_modeEnteredTime = 0;
+
+static FaultLogEntry s_log[LOG_CAPACITY];
+static uint8_t s_logCount = 0;
+static uint8_t s_logHead  = 0;
+
+static void logFault(unsigned long now, FaultCode code, int8_t cellIndex) {
+  s_log[s_logHead].timestamp = now;
+  s_log[s_logHead].code = code;
+  s_log[s_logHead].cellIndex = cellIndex;
+  s_logHead = (s_logHead + 1) % LOG_CAPACITY;
+  if (s_logCount < LOG_CAPACITY) s_logCount++;
+}
+
+static const char* faultCodeLabel(FaultCode c) {
+  switch (c) {
+    case RT_FAULT_NONE:                return "None";
+    case RT_FAULT_SENSOR_DISCONNECTED: return "Sensor Disconnected";
+    case RT_FAULT_INVALID_READING:     return "Invalid Reading";
+    case RT_FAULT_ADC_FROZEN:          return "ADC Frozen";
+    case RT_FAULT_RELAY_MISMATCH:      return "Relay Mismatch";
+  }
+  return "Unknown";
+}
+
+static void evaluateCell(uint8_t i, float v, unsigned long now) {
+  bool wasFaulty = s_cellFaulty[i];
+  FaultCode detected = RT_FAULT_NONE;
+
+  if (isnan(v) || isinf(v) || v < -0.5f || v > 6.0f) {
+    detected = RT_FAULT_INVALID_READING;
+  }
+  else if (fabs(v - 3.00f) < RAIL_EPSILON || fabs(v - 4.20f) < RAIL_EPSILON) {
+    if (!s_haveInit || fabs(v - s_prevValue[i]) > RAIL_EPSILON) {
+      s_lastChangeTime[i] = now;
+    }
+    if (now - s_lastChangeTime[i] >= DISCONNECT_CONFIRM_MS) {
+      detected = RT_FAULT_SENSOR_DISCONNECTED;
+    }
+  }
+  else {
+    if (fabs(v - s_prevValue[i]) > FREEZE_EPSILON) {
+      s_lastChangeTime[i] = now;
+    }
+    if (now - s_lastChangeTime[i] >= FREEZE_TIMEOUT_MS) {
+      detected = RT_FAULT_ADC_FROZEN;
+    }
+  }
+
+  s_prevValue[i] = v;
+
+  if (detected != RT_FAULT_NONE) {
+    s_cellFaulty[i] = true;
+    if (!wasFaulty || s_cellFaultCode[i] != detected) {
+      logFault(now, detected, i);
+    }
+    s_cellFaultCode[i] = detected;
+    s_cellCleanSince[i] = 0;
+  } else {
+    if (wasFaulty) {
+      if (s_cellCleanSince[i] == 0) s_cellCleanSince[i] = now;
+      if (now - s_cellCleanSince[i] >= RECOVERY_CONFIRM_MS) {
+        s_cellFaulty[i] = false;
+        s_cellFaultCode[i] = RT_FAULT_NONE;
+        s_cellCleanSince[i] = 0;
+      }
+    }
+  }
+}
+
+static void evaluateRelay(unsigned long now, bool relayEngaged, bool relayFaultActive) {
+  if (relayFaultActive) {
+    if (s_relayFaultStartTime == 0) s_relayFaultStartTime = now;
+    bool mismatchNow = relayEngaged && (now - s_relayFaultStartTime >= RELAY_RESPONSE_MAX_MS);
+    if (mismatchNow && !s_relayMismatch) {
+      logFault(now, RT_FAULT_RELAY_MISMATCH, -1);
+    }
+    s_relayMismatch = mismatchNow;
+  } else {
+    s_relayFaultStartTime = 0;
+    s_relayMismatch = false;
+  }
+}
+
+static void updateMode(unsigned long now) {
+  uint8_t faultyCount = 0;
+  for (uint8_t i = 0; i < s_numCells; i++) if (s_cellFaulty[i]) faultyCount++;
+
+  OperationalMode desired;
+  if (s_relayMismatch || faultyCount >= s_numCells) {
+    desired = MODE_SHUTDOWN;
+  } else if (faultyCount >= 2) {
+    desired = MODE_FAILSAFE;
+  } else if (faultyCount == 1) {
+    desired = MODE_DEGRADED;
+  } else {
+    desired = MODE_NORMAL;
+  }
+
+  if (desired != s_mode) {
+    bool improving = desired < s_mode;
+    if (improving) {
+      if (s_mode == MODE_SHUTDOWN)      s_mode = MODE_FAILSAFE;
+      else if (s_mode == MODE_FAILSAFE) s_mode = MODE_DEGRADED;
+      else if (s_mode == MODE_DEGRADED) s_mode = MODE_NORMAL;
+    } else {
+      s_mode = desired;
+    }
+    s_modeEnteredTime = now;
+  }
+
+  if (s_mode == MODE_FAILSAFE && (now - s_modeEnteredTime >= SHUTDOWN_ESCALATION_MS)) {
+    s_mode = MODE_SHUTDOWN;
+    s_modeEnteredTime = now;
+  }
+}
+
+void runtime_init(uint8_t numCells) {
+  s_numCells = (numCells > MAX_CELLS) ? MAX_CELLS : numCells;
+  for (uint8_t i = 0; i < s_numCells; i++) {
+    s_prevValue[i] = 0;
+    s_lastChangeTime[i] = 0;
+    s_cellFaulty[i] = false;
+    s_cellFaultCode[i] = RT_FAULT_NONE;
+    s_cellCleanSince[i] = 0;
+  }
+  s_mode = MODE_NORMAL;
+  s_modeEnteredTime = 0;
+  s_logCount = 0;
+  s_logHead = 0;
+  s_haveInit = true;
+}
+
+void runtime_update(unsigned long now, const float cellV[], uint8_t numCells,
+                    bool relayEngaged, bool relayFaultActive) {
+  uint8_t n = (numCells > s_numCells) ? s_numCells : numCells;
+  for (uint8_t i = 0; i < n; i++) {
+    evaluateCell(i, cellV[i], now);
+  }
+  evaluateRelay(now, relayEngaged, relayFaultActive);
+  updateMode(now);
+}
+
+OperationalMode runtime_getMode() { return s_mode; }
+
+const char* runtime_getModeLabel() {
+  switch (s_mode) {
+    case MODE_NORMAL:   return "NORMAL";
+    case MODE_DEGRADED:  return "DEGRADED";
+    case MODE_FAILSAFE:  return "FAILSAFE";
+    case MODE_SHUTDOWN:  return "SHUTDOWN";
+  }
+  return "UNKNOWN";
+}
+
+bool runtime_isCellFaulty(uint8_t index) {
+  if (index >= s_numCells) return false;
+  return s_cellFaulty[index];
+}
+
+bool runtime_forcesShutdown() {
+  return s_mode == MODE_SHUTDOWN;
+}
+
+uint8_t runtime_getFaultLogCount() { return s_logCount; }
+
+FaultLogEntry runtime_getFaultLogEntry(uint8_t i) {
+  if (i >= s_logCount) {
+    FaultLogEntry empty = {0, RT_FAULT_NONE, -1};
+    return empty;
+  }
+  int idx = (int)s_logHead - 1 - (int)i;
+  while (idx < 0) idx += LOG_CAPACITY;
+  return s_log[idx];
+}
+
+void runtime_printFaultLog() {
+  Serial.println("---- Fault Log (most recent first) ----");
+  for (uint8_t i = 0; i < s_logCount; i++) {
+    FaultLogEntry e = runtime_getFaultLogEntry(i);
+    Serial.print("[t="); Serial.print(e.timestamp);
+    Serial.print("ms] "); Serial.print(faultCodeLabel(e.code));
+    if (e.cellIndex >= 0) {
+      Serial.print(" (Cell "); Serial.print(e.cellIndex + 1); Serial.print(")");
+    }
+    Serial.println();
+  }
+  Serial.println("----------------------------------------");
+}
