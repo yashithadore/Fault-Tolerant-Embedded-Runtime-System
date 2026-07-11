@@ -1,0 +1,137 @@
+#ifndef HMI_KERNEL_H
+#define HMI_KERNEL_H
+
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+
+void hmi_init(LiquidCrystal_I2C &lcdRef);
+
+void hmi_update(unsigned long now,
+                float packAvg, float imbalancePct,
+                const float cellV[], uint8_t numCells,
+                uint8_t weakestIdx, uint8_t strongestIdx,
+                const char* battStateLabel,
+                bool safetyOverrideActive,
+                const char* safetyStateLabel,
+                const char* safetyReasonLabel,
+                bool relayEngaged);
+
+#endif
+/////////hmi_kernel.cpp
+#include "hmi_kernel.h"
+
+static const unsigned long ROTATE_INTERVAL_MS = 2500;
+static const uint8_t NUM_SCREENS = 4;
+
+static LiquidCrystal_I2C* s_lcd = nullptr;
+
+static unsigned long s_lastRotateTime = 0;
+static uint8_t       s_screenIndex    = 0;
+
+static char s_lastLine1[17] = {0};
+static char s_lastLine2[17] = {0};
+static bool s_havePrevLines = false;
+
+static bool          s_prevRelayEngaged = true;
+static unsigned long s_relayToggleCount = 0;
+static bool          s_prevOverrideActive = false;
+static unsigned long s_faultEventCount = 0;
+
+static void renderLines(const char* line1, const char* line2) {
+  char padded1[17], padded2[17];
+  snprintf(padded1, 17, "%-16s", line1);
+  snprintf(padded2, 17, "%-16s", line2);
+
+  if (!s_havePrevLines || strcmp(padded1, s_lastLine1) != 0) {
+    s_lcd->setCursor(0, 0);
+    s_lcd->print(padded1);
+    strcpy(s_lastLine1, padded1);
+  }
+  if (!s_havePrevLines || strcmp(padded2, s_lastLine2) != 0) {
+    s_lcd->setCursor(0, 1);
+    s_lcd->print(padded2);
+    strcpy(s_lastLine2, padded2);
+  }
+  s_havePrevLines = true;
+}
+
+static void buildOverviewScreen(char l1[17], char l2[17], float avg, float imbalance, const char* battState) {
+  snprintf(l1, 17, "A:%.2fV I:%.1f%%", avg, imbalance);
+  snprintf(l2, 17, "%s", battState);
+}
+
+static void buildCellsScreen(char l1[17], char l2[17], const float cellV[], uint8_t n) {
+  if (n >= 2) snprintf(l1, 17, "C1:%.2f C2:%.2f", cellV[0], cellV[1]);
+  else        snprintf(l1, 17, "C1:%.2f", cellV[0]);
+
+  if (n >= 4) snprintf(l2, 17, "C3:%.2f C4:%.2f", cellV[2], cellV[3]);
+  else if (n >= 3) snprintf(l2, 17, "C3:%.2f", cellV[2]);
+  else strcpy(l2, "");
+}
+
+static void buildProtectionScreen(char l1[17], char l2[17], bool relayEngaged, const char* safetyState) {
+  snprintf(l1, 17, "Relay: %s", relayEngaged ? "CLOSED" : "OPEN");
+  snprintf(l2, 17, "State: %s", safetyState);
+}
+
+static void buildDiagnosticsScreen(char l1[17], char l2[17], uint8_t weakestIdx, uint8_t strongestIdx,
+                                    unsigned long faultCount, unsigned long relayToggles) {
+  snprintf(l1, 17, "Wk:C%d St:C%d", weakestIdx + 1, strongestIdx + 1);
+  snprintf(l2, 17, "Flts:%lu Tgl:%lu", faultCount, relayToggles);
+}
+
+static void buildFaultOverrideScreen(char l1[17], char l2[17], const char* stateLabel, const char* reasonLabel) {
+  snprintf(l1, 17, "!! %s", stateLabel);
+  snprintf(l2, 17, "%s", reasonLabel);
+}
+
+void hmi_init(LiquidCrystal_I2C &lcdRef) {
+  s_lcd = &lcdRef;
+  s_screenIndex = 0;
+  s_lastRotateTime = 0;
+  s_havePrevLines = false;
+}
+
+void hmi_update(unsigned long now,
+                float packAvg, float imbalancePct,
+                const float cellV[], uint8_t numCells,
+                uint8_t weakestIdx, uint8_t strongestIdx,
+                const char* battStateLabel,
+                bool safetyOverrideActive,
+                const char* safetyStateLabel,
+                const char* safetyReasonLabel,
+                bool relayEngaged) {
+  if (s_lcd == nullptr) return;
+
+  if (relayEngaged != s_prevRelayEngaged) {
+    s_relayToggleCount++;
+    s_prevRelayEngaged = relayEngaged;
+  }
+  if (safetyOverrideActive && !s_prevOverrideActive) {
+    s_faultEventCount++;
+  }
+  s_prevOverrideActive = safetyOverrideActive;
+
+  char l1[17], l2[17];
+
+  if (safetyOverrideActive) {
+    buildFaultOverrideScreen(l1, l2, safetyStateLabel, safetyReasonLabel);
+    renderLines(l1, l2);
+    s_lastRotateTime = now;
+    return;
+  }
+
+  if (now - s_lastRotateTime >= ROTATE_INTERVAL_MS) {
+    s_lastRotateTime = now;
+    s_screenIndex = (s_screenIndex + 1) % NUM_SCREENS;
+  }
+
+  switch (s_screenIndex) {
+    case 0: buildOverviewScreen(l1, l2, packAvg, imbalancePct, battStateLabel); break;
+    case 1: buildCellsScreen(l1, l2, cellV, numCells); break;
+    case 2: buildProtectionScreen(l1, l2, relayEngaged, safetyStateLabel); break;
+    case 3: buildDiagnosticsScreen(l1, l2, weakestIdx, strongestIdx, s_faultEventCount, s_relayToggleCount); break;
+  }
+
+  renderLines(l1, l2);
+}
