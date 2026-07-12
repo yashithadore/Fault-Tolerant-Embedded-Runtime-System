@@ -4,17 +4,17 @@ Fault-Tolerant Embedded Runtime System using ESP32 for autonomous fault detectio
 
 An integrated, non-blocking embedded battery management system built on ESP32, combining six functional layers into a single Wokwi project: sensing & analytics, safety protection, embedded HMI, fault-tolerant runtime, cloud telemetry, and an executive risk dashboard.
 
-## 🔗 Live Simulation
+##  Live Simulation
 **Wokwi Project:** (https://wokwi.com/projects/469158982357556225)
 
-## 📊 Dashboard
+##  Dashboard
 **Blynk Dashboard:** (https://blynk.cloud/dashboard/721688/templates/1513878/info)
 
-## 🧩 System Architecture
+##  System Architecture
 
 Battery/Safety/Runtime state feeds into HMI, Telemetry, and Dashboard modules — all sharing sensor data through getter functions, never touching each other's internals. Full diagram in `/docs` and in the project report.
 
-## 🔧 Modules
+##  Modules
 
 | File | Responsibility |
 |---|---|
@@ -25,7 +25,7 @@ Battery/Safety/Runtime state feeds into HMI, Telemetry, and Dashboard modules �
 | `telemetry_kernel.h/.cpp` | Event-driven Blynk cloud sync, WiFi reconnect handling, signal monitoring |
 | `dashboard_kernel.h/.cpp` | Risk scoring (0–100), severity tiers, operator recommendations |
 
-## ⚙️ Hardware (Wokwi simulated)
+## Hardware (Wokwi simulated)
 
 - ESP32 DevKit-C V4
 - 4× Potentiometer (cell voltage simulation)
@@ -44,11 +44,11 @@ Battery/Safety/Runtime state feeds into HMI, Telemetry, and Dashboard modules �
    - `BLYNK_AUTH`
 4. Run the simulation — Serial Monitor will show live pack + safety + runtime status.
 
-## 📄 Documentation
+##  Documentation
 
-- Full project report: `docs/Project_Report.pdf`
-- Architecture & workflow diagrams: `docs/`
+- Full project report: (https://1drv.ms/w/c/eaff95a649487188/IQA0Ryz5vm4pToEfhH145GYvAXg3K9uXIXacOKgrtbR-woU?e=S6PrNG)
 
-## 👤 Author
+
+##  Author
 
 **Yashitha D**
