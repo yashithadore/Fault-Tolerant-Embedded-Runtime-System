@@ -1,5 +1,4 @@
-# Fault-Tolerant-Embedded-Runtime-System
-Fault-Tolerant Embedded Runtime System using ESP32 for autonomous fault detection, runtime monitoring, relay control, and safe state management with Wokwi simulation.
+
 # Adaptive Multi-Cell Battery Management System (ESP32)
 
 An integrated, non-blocking embedded battery management system built on ESP32, combining six functional layers into a single Wokwi project: sensing & analytics, safety protection, embedded HMI, fault-tolerant runtime, cloud telemetry, and an executive risk dashboard.
