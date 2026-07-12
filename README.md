@@ -7,7 +7,7 @@ An integrated, non-blocking embedded battery management system built on ESP32, c
 **Wokwi Project:** (https://wokwi.com/projects/469158982357556225)
 
 ##  Dashboard
-**Blynk Dashboard:** (https://blynk.cloud/dashboard/721688/templates/1513878/info)
+**Blynk Dashboard:**(https://blynk.cloud/dashboard/721688/global/devices/236625/organization/721688/devices/2193992/dashboard)
 
 ##  System Architecture
 
